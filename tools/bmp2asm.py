@@ -22,6 +22,14 @@ BMP_PATH = REPO_ROOT / "game_final_assets" / "male_face_down.bmp"
 PALLET_ASM_PATH = REPO_ROOT / "src" / "pallet.asm"
 CHARACTER_ASM_PATH = REPO_ROOT / "src" / "character.asm"
 
+# Extra sprite palettes (colors only, no tile data) that get cycled through
+# at runtime by the timer in main.asm - see pallet_table/load_char_pallet
+# below and cycle_char_pallet in main.asm.
+EXTRA_PALLET_BMPS = [
+    ("pallet_char_1", REPO_ROOT / "game_final_assets" / "male_1.bmp"),
+    ("pallet_char_2", REPO_ROOT / "game_final_assets" / "male_2.bmp"),
+]
+
 # Bits per pixel (bitplanes) to pack each output tile with. This is
 # independent of the BMP's own on-disk bpp (queried from the file itself
 # below) - e.g. a source BMP could be 8bpp/256-color while the target SNES
@@ -168,39 +176,77 @@ def build_sprite_info(tiles_x, tiles_y):
     return info, quads_x, quads_y
 
 
-def write_pallet_asm(path, palette, bmp_bpp):
+def write_pallet_asm(path, pallets):
+    """pallets is a list of (asm_name, bmp_path, palette, bmp_bpp) tuples.
+    The first entry is the primary pallet (pallet_char) - its bank and color
+    count set the DMA parameters shared by every pallet, since they must all
+    be the same size (16 colors) to be interchangeable at runtime."""
+    primary_name, primary_bmp, primary_palette, primary_bpp = pallets[0]
+
     lines = []
     lines.append("; Init pallets")
     lines.append("")
     lines.append(".segment \"CODE\"")
     lines.append("")
-    lines.append(f"; Color palette extracted from {BMP_PATH.name} ({len(palette)} colors, "
-                  f"{bmp_bpp} bits/pixel in the source BMP).")
-    lines.append("; SNES CGRAM color format is 2 bytes per color: 0bbbbbgggggrrrrr")
-    lines.append("; (8-bit BMP channels are truncated down to 5 bits each.)")
-    lines.append("pallet_char:")
-    for i, rgb in enumerate(palette):
-        word = to_snes_color(rgb)
-        r, g, b = rgb
-        lines.append(f"\t.word ${word:04x} ; {i:2d}: bmp rgb=({r:3d},{g:3d},{b:3d})")
-    lines.append("pallet_char_end:")
+
+    for name, bmp_path, palette, bmp_bpp in pallets:
+        if len(palette) != len(primary_palette):
+            raise ValueError(
+                f"{bmp_path.name} has {len(palette)} colors, expected "
+                f"{len(primary_palette)} to match {primary_bmp.name}"
+            )
+        lines.append(f"; Color palette extracted from {bmp_path.name} ({len(palette)} colors, "
+                      f"{bmp_bpp} bits/pixel in the source BMP).")
+        lines.append("; SNES CGRAM color format is 2 bytes per color: 0bbbbbgggggrrrrr")
+        lines.append("; (8-bit BMP channels are truncated down to 5 bits each.)")
+        lines.append(f"{name}:")
+        for i, rgb in enumerate(palette):
+            word = to_snes_color(rgb)
+            r, g, b = rgb
+            lines.append(f"\t.word ${word:04x} ; {i:2d}: bmp rgb=({r:3d},{g:3d},{b:3d})")
+        lines.append(f"{name}_end:")
+        lines.append("")
+        lines.append(f"{name}_size = {name}_end - {name}")
+        lines.append("")
+
+    lines.append("; Fourth pallet slot for the cycling timer in main.asm - deliberately not")
+    lines.append("; backed by its own BMP, so it aliases whatever bytes happen to follow the")
+    lines.append(f"; last real pallet ({pallets[-1][0]}) in ROM.")
+    lines.append(f"{primary_name}_3 = {pallets[-1][0]}_end")
     lines.append("")
-    lines.append("pallet_char_size = pallet_char_end - pallet_char")
+
+    lines.append("; The pallets the per-second timer in main.asm's nmi handler rotates the")
+    lines.append("; sprite through. Low words only - every pallet here lives in the same "
+                  f"bank as {primary_name}.")
+    lines.append("pallet_table:")
+    for name, _, _, _ in pallets:
+        lines.append(f"\t.word .loword({name})")
+    lines.append(f"\t.word .loword({primary_name}_3)")
+    lines.append("pallet_table_end:")
     lines.append("")
-    lines.append("; Loads pallet_char into CGRAM as sprite palette 0 (colors 128-143).")
-    lines.append("; Call during forced blank. Assumes/leaves A8 XY16 (see init.asm).")
+    lines.append("pallet_table_count = (pallet_table_end - pallet_table) / 2")
+    lines.append("")
+
+    lines.append("; Loads pallet_table[A] (A = pallet index, 8-bit) into CGRAM as sprite")
+    lines.append("; palette 0 (colors 128-143). Call during forced blank or v-blank.")
+    lines.append("; Assumes/leaves A8 XY16 (see init.asm).")
     lines.append("load_char_pallet:")
+    lines.append("\tpha                 ; stash the index while we set CGADD")
     lines.append("\tlda #128            ; CGRAM color index 128 = sprite palette 0, color 0")
     lines.append("\tsta CGADD")
     lines.append("")
-    lines.append("\tsetAXY16")
-    lines.append("\tldx #.loword(pallet_char)")
-    lines.append("\tstx A1T1L")
-    lines.append("\tldx #pallet_char_size")
-    lines.append("\tstx DAS1L")
+    lines.append("\tpla")
+    lines.append("\tasl a               ; index -> byte offset into pallet_table")
+    lines.append("\trep #$20            ; A16 (high byte is stale - mask it below)")
+    lines.append("\tand #$00ff")
+    lines.append("\ttax")
+    lines.append("\tlda pallet_table,x")
+    lines.append("\tsta A1T1L")
+    lines.append(f"\tlda #{primary_name}_size ; every pallet is the same size")
+    lines.append("\tsta DAS1L")
     lines.append("")
     lines.append("\tsetA8")
-    lines.append("\tlda #^pallet_char")
+    lines.append(f"\tlda #^{primary_name}")
     lines.append("\tsta A1B1")
     lines.append("\tlda #$22            ; CGDATA")
     lines.append("\tsta BBAD1")
@@ -363,7 +409,14 @@ def main():
     sprite_info, quads_x, quads_y = build_sprite_info(tiles_x, tiles_y)
     print(f"{quads_x}x{quads_y} = {len(sprite_info)} 16x16 OAM sprites needed")
 
-    write_pallet_asm(PALLET_ASM_PATH, palette, bmp_bpp)
+    pallets = [("pallet_char", BMP_PATH, palette, bmp_bpp)]
+    for name, extra_bmp_path in EXTRA_PALLET_BMPS:
+        extra_width, extra_height, extra_bpp, extra_palette, _ = load_indexed_bmp(extra_bmp_path)
+        print(f"{extra_bmp_path.name}: {extra_width}x{extra_height}, bmp_bpp={extra_bpp}, "
+              f"{len(extra_palette)} palette entries")
+        pallets.append((name, extra_bmp_path, extra_palette, extra_bpp))
+
+    write_pallet_asm(PALLET_ASM_PATH, pallets)
     write_character_asm(CHARACTER_ASM_PATH, packed, width, height, tiles_x, tiles_y,
                          PIXEL_BPP, len(palette), sprite_info, quads_x, quads_y)
     print(f"wrote {PALLET_ASM_PATH}")
