@@ -18,7 +18,7 @@ from pathlib import Path
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BMP_PATH = REPO_ROOT / "char.bmp"
+BMP_PATH = REPO_ROOT / "game_final_assets" / "male_face_down.bmp"
 PALLET_ASM_PATH = REPO_ROOT / "src" / "pallet.asm"
 CHARACTER_ASM_PATH = REPO_ROOT / "src" / "character.asm"
 
@@ -174,7 +174,7 @@ def write_pallet_asm(path, palette, bmp_bpp):
     lines.append("")
     lines.append(".segment \"CODE\"")
     lines.append("")
-    lines.append(f"; Color palette extracted from char.bmp ({len(palette)} colors, "
+    lines.append(f"; Color palette extracted from {BMP_PATH.name} ({len(palette)} colors, "
                   f"{bmp_bpp} bits/pixel in the source BMP).")
     lines.append("; SNES CGRAM color format is 2 bytes per color: 0bbbbbgggggrrrrr")
     lines.append("; (8-bit BMP channels are truncated down to 5 bits each.)")
@@ -221,7 +221,7 @@ def write_character_asm(path, packed, width, height, tiles_x, tiles_y, pixel_bpp
     lines.append("")
     lines.append(".segment \"CODE\"")
     lines.append("")
-    lines.append("; Character tile data, auto-generated from char.bmp by tools/bmp2asm.py")
+    lines.append(f"; Character tile data, auto-generated from {BMP_PATH.name} by tools/bmp2asm.py")
     lines.append(f"; {width} x {height} pixels ({tiles_x} x {tiles_y} tiles), {pixel_bpp} bits/pixel, "
                   f"indices into pallet_char (src/pallet.asm, {num_colors} colors).")
     lines.append("; Packed as SNES-native planar OAM tiles, padded out to a "
