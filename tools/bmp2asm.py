@@ -12,6 +12,7 @@ asm's target bpp (how many bitplanes each tile is packed with) are tracked
 separately and can differ - see PIXEL_BPP below.
 """
 
+import colorsys
 import struct
 import sys
 from pathlib import Path
@@ -22,12 +23,21 @@ BMP_PATH = REPO_ROOT / "game_final_assets" / "male_face_down.bmp"
 PALLET_ASM_PATH = REPO_ROOT / "src" / "pallet.asm"
 CHARACTER_ASM_PATH = REPO_ROOT / "src" / "character.asm"
 
-# Extra sprite palettes (colors only, no tile data) that get cycled through
-# at runtime by the timer in main.asm - see pallet_table/load_char_pallet
-# below and cycle_char_pallet in main.asm.
-EXTRA_PALLET_BMPS = [
-    ("pallet_char_1", REPO_ROOT / "game_final_assets" / "male_1.bmp"),
-    ("pallet_char_2", REPO_ROOT / "game_final_assets" / "male_2.bmp"),
+# Extra sprite palettes (colors only, no tile data) that get cycled through at
+# runtime by the timer in main.asm's nmi handler - see pallet_table and
+# load_char_pallet below.
+#
+# These are *derived* from pallet_char itself (via derive_pallet_variant)
+# rather than read from separate BMPs: the only other skin-tone-recolor BMPs
+# in the asset library (male_1.bmp/male_2.bmp) turned out to be a different
+# pose/composition than male_face_down.bmp, not a recolor of it, so swapping
+# their palettes onto male_face_down's pixel data produced a mismatched
+# result no index-remapping could fix. Deriving from pallet_char guarantees
+# the variant always matches the on-screen sprite.
+PALLET_VARIANTS = [
+    # (name, hue_shift_degrees, saturation_scale, value_scale)
+    ("pallet_char_1", -18, 1.05, 0.92),  # deeper/tanner
+    ("pallet_char_2", 18, 0.85, 1.05),   # paler/golden
 ]
 
 # Bits per pixel (bitplanes) to pack each output tile with. This is
@@ -87,6 +97,26 @@ def to_snes_color(rgb):
     b5 = channel_8_to_5(b)
     # AGENTS.md: colors are 2 bytes, _bbbbbgggggrrrrr (bit 15 unused)
     return (b5 << 10) | (g5 << 5) | r5
+
+
+def derive_pallet_variant(base_palette, hue_shift_deg, sat_scale, val_scale, gray_threshold=0.12):
+    """Build a recolor variant of base_palette by rotating hue (and scaling
+    saturation/value) of its non-grayscale entries, in HSV space. Near-gray
+    entries (outlines, eye whites, underwear, etc. - saturation below
+    gray_threshold) are left untouched, so only the skin-tone ramp shifts and
+    the sprite's structural colors stay put."""
+    out = []
+    for r, g, b in base_palette:
+        h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        if s < gray_threshold:
+            out.append((r, g, b))
+            continue
+        h = (h + hue_shift_deg / 360.0) % 1.0
+        s = max(0.0, min(1.0, s * sat_scale))
+        v = max(0.0, min(1.0, v * val_scale))
+        nr, ng, nb = colorsys.hsv_to_rgb(h, s, v)
+        out.append((round(nr * 255), round(ng * 255), round(nb * 255)))
+    return out
 
 
 def split_into_tiles(pixels, width, height):
@@ -177,11 +207,11 @@ def build_sprite_info(tiles_x, tiles_y):
 
 
 def write_pallet_asm(path, pallets):
-    """pallets is a list of (asm_name, bmp_path, palette, bmp_bpp) tuples.
+    """pallets is a list of (asm_name, source_comment_lines, palette) tuples.
     The first entry is the primary pallet (pallet_char) - its bank and color
     count set the DMA parameters shared by every pallet, since they must all
     be the same size (16 colors) to be interchangeable at runtime."""
-    primary_name, primary_bmp, primary_palette, primary_bpp = pallets[0]
+    primary_name, _, primary_palette = pallets[0]
 
     lines = []
     lines.append("; Init pallets")
@@ -189,21 +219,18 @@ def write_pallet_asm(path, pallets):
     lines.append(".segment \"CODE\"")
     lines.append("")
 
-    for name, bmp_path, palette, bmp_bpp in pallets:
+    for name, source_comment_lines, palette in pallets:
         if len(palette) != len(primary_palette):
             raise ValueError(
-                f"{bmp_path.name} has {len(palette)} colors, expected "
-                f"{len(primary_palette)} to match {primary_bmp.name}"
+                f"{name} has {len(palette)} colors, expected "
+                f"{len(primary_palette)} to match {primary_name}"
             )
-        lines.append(f"; Color palette extracted from {bmp_path.name} ({len(palette)} colors, "
-                      f"{bmp_bpp} bits/pixel in the source BMP).")
-        lines.append("; SNES CGRAM color format is 2 bytes per color: 0bbbbbgggggrrrrr")
-        lines.append("; (8-bit BMP channels are truncated down to 5 bits each.)")
+        lines.extend(source_comment_lines)
         lines.append(f"{name}:")
         for i, rgb in enumerate(palette):
             word = to_snes_color(rgb)
             r, g, b = rgb
-            lines.append(f"\t.word ${word:04x} ; {i:2d}: bmp rgb=({r:3d},{g:3d},{b:3d})")
+            lines.append(f"\t.word ${word:04x} ; {i:2d}: rgb=({r:3d},{g:3d},{b:3d})")
         lines.append(f"{name}_end:")
         lines.append("")
         lines.append(f"{name}_size = {name}_end - {name}")
@@ -219,7 +246,7 @@ def write_pallet_asm(path, pallets):
     lines.append("; sprite through. Low words only - every pallet here lives in the same "
                   f"bank as {primary_name}.")
     lines.append("pallet_table:")
-    for name, _, _, _ in pallets:
+    for name, _, _ in pallets:
         lines.append(f"\t.word .loword({name})")
     lines.append(f"\t.word .loword({primary_name}_3)")
     lines.append("pallet_table_end:")
@@ -409,12 +436,25 @@ def main():
     sprite_info, quads_x, quads_y = build_sprite_info(tiles_x, tiles_y)
     print(f"{quads_x}x{quads_y} = {len(sprite_info)} 16x16 OAM sprites needed")
 
-    pallets = [("pallet_char", BMP_PATH, palette, bmp_bpp)]
-    for name, extra_bmp_path in EXTRA_PALLET_BMPS:
-        extra_width, extra_height, extra_bpp, extra_palette, _ = load_indexed_bmp(extra_bmp_path)
-        print(f"{extra_bmp_path.name}: {extra_width}x{extra_height}, bmp_bpp={extra_bpp}, "
-              f"{len(extra_palette)} palette entries")
-        pallets.append((name, extra_bmp_path, extra_palette, extra_bpp))
+    primary_comment = [
+        f"; Color palette extracted from {BMP_PATH.name} ({len(palette)} colors, "
+        f"{bmp_bpp} bits/pixel in the source BMP).",
+        "; SNES CGRAM color format is 2 bytes per color: 0bbbbbgggggrrrrr",
+        "; (8-bit BMP channels are truncated down to 5 bits each.)",
+    ]
+    pallets = [("pallet_char", primary_comment, palette)]
+    for name, hue_shift, sat_scale, val_scale in PALLET_VARIANTS:
+        variant_palette = derive_pallet_variant(palette, hue_shift, sat_scale, val_scale)
+        print(f"{name}: derived from pallet_char (hue{hue_shift:+d} deg, "
+              f"sat x{sat_scale}, val x{val_scale})")
+        variant_comment = [
+            f"; Recolor of pallet_char (hue{hue_shift:+d} deg, sat x{sat_scale}, val "
+            f"x{val_scale} on non-grayscale entries - see derive_pallet_variant in",
+            "; tools/bmp2asm.py). Not backed by its own BMP: the only other skin-tone-",
+            "; recolor BMPs in the asset library (male_1.bmp/male_2.bmp) turned out to be",
+            "; a different pose than male_face_down.bmp, not a recolor of it.",
+        ]
+        pallets.append((name, variant_comment, variant_palette))
 
     write_pallet_asm(PALLET_ASM_PATH, pallets)
     write_character_asm(CHARACTER_ASM_PATH, packed, width, height, tiles_x, tiles_y,
