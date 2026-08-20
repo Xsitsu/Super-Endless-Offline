@@ -3,12 +3,13 @@
 Convert an indexed-color .bmp into SNES-ready ca65 assembly:
   - a CGRAM color table (pallet.asm), converting the BMP's 8-bit-per-channel
     palette down to the SNES's 5-bit-per-channel 0bbbbbgggggrrrrr format
-  - a packed pixel-index data block (character.asm), converting the BMP's
-    on-disk bits-per-pixel down to a chosen SNES bits-per-pixel
+  - sprite character (tile) data (character.asm), converting the BMP's pixels
+    into the SNES's planar 4bpp OAM tile format, plus a table describing how
+    to lay the tiles out on screen as 16x16 OAM sprites
 
 The BMP's bpp (how many bits its own palette indices are stored in) and the
-asm's target bpp (how many bits each packed pixel takes in the output data
-block) are tracked separately and can differ - see PIXEL_BPP below.
+asm's target bpp (how many bitplanes each tile is packed with) are tracked
+separately and can differ - see PIXEL_BPP below.
 """
 
 import struct
@@ -21,11 +22,21 @@ BMP_PATH = REPO_ROOT / "char.bmp"
 PALLET_ASM_PATH = REPO_ROOT / "src" / "pallet.asm"
 CHARACTER_ASM_PATH = REPO_ROOT / "src" / "character.asm"
 
-# Bits per pixel to pack the output index data at. This is independent of
-# the BMP's own on-disk bpp (queried from the file itself below) - e.g. a
-# source BMP could be 8bpp/256-color while the target SNES graphics mode
-# is only 4bpp/16-color, or vice versa. Must divide evenly into 8.
+# Bits per pixel (bitplanes) to pack each output tile with. This is
+# independent of the BMP's own on-disk bpp (queried from the file itself
+# below) - e.g. a source BMP could be 8bpp/256-color while the target SNES
+# graphics mode is only 4bpp/16-color, or vice versa. Must be even (SNES
+# planar tiles are built from pairs of interleaved bitplanes) and divide
+# evenly into 8.
 PIXEL_BPP = 4
+
+# The SNES sprite character table is always addressed as if it were a sheet
+# 16 tiles wide - a 16x16 OAM sprite's four 8x8 tiles are tile numbers
+# c, c+1, c+0x10, c+0x11. So every row of tiles we generate must be padded
+# out to 16 tiles even though our sheet is narrower than that.
+TABLE_WIDTH_TILES = 16
+
+TILE_SIZE = 8
 
 
 def load_indexed_bmp(path):
@@ -70,47 +81,96 @@ def to_snes_color(rgb):
     return (b5 << 10) | (g5 << 5) | r5
 
 
-def pack_pixels(pixels, bpp):
-    """Pack a stream of palette-index pixels into bytes at `bpp` bits/pixel.
-    Pixels per byte are packed MSB-first (the first pixel in a group lands
-    in the high bits of the byte)."""
-    if 8 % bpp != 0:
-        raise ValueError(f"PIXEL_BPP={bpp} must divide evenly into 8")
+def split_into_tiles(pixels, width, height):
+    """Split a row-major flat list of palette-index pixels into 8x8 tiles,
+    in left-to-right, top-to-bottom tile order. Returns (tiles, tiles_x,
+    tiles_y), where each tile is a list of 8 rows of 8 pixel indices."""
+    if width % TILE_SIZE != 0 or height % TILE_SIZE != 0:
+        raise ValueError(f"{width}x{height} is not a multiple of {TILE_SIZE}x{TILE_SIZE}")
+
+    tiles_x = width // TILE_SIZE
+    tiles_y = height // TILE_SIZE
+    tiles = []
+    for ty in range(tiles_y):
+        for tx in range(tiles_x):
+            rows = []
+            for y in range(TILE_SIZE):
+                row_start = (ty * TILE_SIZE + y) * width + tx * TILE_SIZE
+                rows.append(pixels[row_start:row_start + TILE_SIZE])
+            tiles.append(rows)
+    return tiles, tiles_x, tiles_y
+
+
+def tile_to_planar(tile_pixels, bpp):
+    """Convert an 8x8 block of palette-index pixels into the SNES's planar
+    tile format: `bpp` bitplanes, interleaved two at a time (16 bytes per
+    plane-pair: 2 bytes/row, low plane of the pair first). E.g. at 4bpp,
+    planes 0&1 are stored as 16 bytes, followed by planes 2&3 as 16 more."""
+    if bpp % 2 != 0:
+        raise ValueError(f"bpp={bpp} must be even (planes are interleaved in pairs)")
 
     max_index = (1 << bpp) - 1
-    for p in pixels:
-        if p > max_index:
-            raise ValueError(
-                f"pixel index {p} does not fit in target PIXEL_BPP={bpp} "
-                f"(max {max_index}) - raise PIXEL_BPP or remap the palette"
-            )
+    out = bytearray(TILE_SIZE * bpp)
+    for plane_pair in range(bpp // 2):
+        base = plane_pair * 2 * TILE_SIZE
+        for row in range(TILE_SIZE):
+            lo = hi = 0
+            for col in range(TILE_SIZE):
+                index = tile_pixels[row][col]
+                if index > max_index:
+                    raise ValueError(
+                        f"pixel index {index} does not fit in target PIXEL_BPP={bpp} "
+                        f"(max {max_index}) - raise PIXEL_BPP or remap the palette"
+                    )
+                bit = 7 - col
+                if index & (1 << (plane_pair * 2)):
+                    lo |= (1 << bit)
+                if index & (1 << (plane_pair * 2 + 1)):
+                    hi |= (1 << bit)
+            out[base + row * 2] = lo
+            out[base + row * 2 + 1] = hi
+    return bytes(out)
 
-    pixels_per_byte = 8 // bpp
+
+def pack_char_table(tiles, tiles_x, tiles_y, bpp):
+    """Lay tiles out row-major into a TABLE_WIDTH_TILES-wide character
+    table, padding each row out with blank tiles so that VRAM tile numbers
+    follow the sheet's real 6-wide layout while still landing 16 (0x10)
+    tiles apart per row, as the 16x16 OAM hardware requires."""
+    blank_tile = bytes(TILE_SIZE * bpp)
     packed = bytearray()
-    for i in range(0, len(pixels), pixels_per_byte):
-        chunk = pixels[i:i + pixels_per_byte]
-        chunk += [0] * (pixels_per_byte - len(chunk))  # pad final byte if needed
-        byte = 0
-        for j, index in enumerate(chunk):
-            shift = 8 - bpp * (j + 1)
-            byte |= (index & max_index) << shift
-        packed.append(byte)
+    for ty in range(tiles_y):
+        for tx in range(TABLE_WIDTH_TILES):
+            if tx < tiles_x:
+                packed += tile_to_planar(tiles[ty * tiles_x + tx], bpp)
+            else:
+                packed += blank_tile
     return bytes(packed)
+
+
+def build_sprite_info(tiles_x, tiles_y):
+    """Every 16x16 OAM sprite covers a 2x2 block of 8x8 tiles. Build the
+    (dx, dy, first-tile-number) for each such block needed to cover the
+    whole sheet, in row-major order. first-tile-number is the tile number
+    of the block's top-left 8x8 tile within the padded character table."""
+    if tiles_x % 2 != 0 or tiles_y % 2 != 0:
+        raise ValueError(f"{tiles_x}x{tiles_y} tiles is not divisible into 16x16 sprites")
+
+    quads_x = tiles_x // 2
+    quads_y = tiles_y // 2
+    info = []
+    for qy in range(quads_y):
+        for qx in range(quads_x):
+            dx = qx * 16
+            dy = qy * 16
+            tile = (qy * 2) * TABLE_WIDTH_TILES + (qx * 2)
+            info.append((dx, dy, tile))
+    return info, quads_x, quads_y
 
 
 def write_pallet_asm(path, palette, bmp_bpp):
     lines = []
     lines.append("; Init pallets")
-    lines.append("")
-    lines.append(".include \"macros.inc\"")
-    lines.append("")
-    lines.append("")
-    lines.append(".macro pallet_16")
-    lines.append("\tlda $f0")
-    lines.append("\tsts CGADD")
-    lines.append("")
-    lines.append(".endmacro")
-    lines.append("")
     lines.append("")
     lines.append(".segment \"CODE\"")
     lines.append("")
@@ -127,26 +187,57 @@ def write_pallet_asm(path, palette, bmp_bpp):
     lines.append("")
     lines.append("pallet_char_size = pallet_char_end - pallet_char")
     lines.append("")
+    lines.append("; Loads pallet_char into CGRAM as sprite palette 0 (colors 128-143).")
+    lines.append("; Call during forced blank. Assumes/leaves A8 XY16 (see init.asm).")
+    lines.append("load_char_pallet:")
+    lines.append("\tlda #128            ; CGRAM color index 128 = sprite palette 0, color 0")
+    lines.append("\tsta CGADD")
+    lines.append("")
+    lines.append("\tsetAXY16")
+    lines.append("\tldx #.loword(pallet_char)")
+    lines.append("\tstx A1T1L")
+    lines.append("\tldx #pallet_char_size")
+    lines.append("\tstx DAS1L")
+    lines.append("")
+    lines.append("\tsetA8")
+    lines.append("\tlda #^pallet_char")
+    lines.append("\tsta A1B1")
+    lines.append("\tlda #$22            ; CGDATA")
+    lines.append("\tsta BBAD1")
+    lines.append("\tlda #$00            ; mode 0: write 1 byte per src, increment src addr")
+    lines.append("\tsta DMAP1")
+    lines.append("\tlda #$02            ; enable DMA channel 1")
+    lines.append("\tsta MDMAEN")
+    lines.append("\trts")
+    lines.append("")
 
     path.write_text("\n".join(lines))
 
 
-def write_character_asm(path, packed, width, height, pixel_bpp, num_colors):
+def write_character_asm(path, packed, width, height, tiles_x, tiles_y, pixel_bpp,
+                         num_colors, sprite_info, quads_x, quads_y):
     lines = []
     lines.append("; Routine for loading in character sprite data")
     lines.append("")
-    lines.append(".include \"macros.inc\"")
-    lines.append("")
     lines.append(".segment \"CODE\"")
     lines.append("")
-    lines.append(f"; Character pixel data, auto-generated from char.bmp by tools/bmp2asm.py")
-    lines.append(f"; {width} x {height} pixels, {pixel_bpp} bits/pixel, indices into pallet_char "
-                  f"(src/pallet.asm, {num_colors} colors).")
-    lines.append(f"; Packed {8 // pixel_bpp} pixel(s) per byte, first pixel in the high bits, "
-                  "row-major starting from the top-left pixel.")
+    lines.append("; Character tile data, auto-generated from char.bmp by tools/bmp2asm.py")
+    lines.append(f"; {width} x {height} pixels ({tiles_x} x {tiles_y} tiles), {pixel_bpp} bits/pixel, "
+                  f"indices into pallet_char (src/pallet.asm, {num_colors} colors).")
+    lines.append("; Packed as SNES-native planar OAM tiles, padded out to a "
+                  f"{TABLE_WIDTH_TILES}-tile-wide character table (see docs/sprites.md) -")
+    lines.append("; i.e. row-major tiles, each row padded with blank tiles out to "
+                  f"{TABLE_WIDTH_TILES} so that VRAM tile numbers land {TABLE_WIDTH_TILES} (0x10)")
+    lines.append("; apart per row, as required by the 16x16 OAM hardware.")
     lines.append("char_width  = " + str(width))
     lines.append("char_height = " + str(height))
+    lines.append("char_tiles_x = " + str(tiles_x))
+    lines.append("char_tiles_y = " + str(tiles_y))
     lines.append("char_pixel_bpp = " + str(pixel_bpp))
+    lines.append("")
+    lines.append("; VRAM word address the tile sheet below must be loaded at - must match")
+    lines.append("; the Base bits configured in OBSEL.")
+    lines.append("char_vram_addr = $0000")
     lines.append("")
     lines.append("char_data:")
 
@@ -159,6 +250,101 @@ def write_character_asm(path, packed, width, height, pixel_bpp, num_colors):
     lines.append("")
     lines.append("char_data_size = char_data_end - char_data")
     lines.append("")
+    lines.append("; Loads char_data into VRAM as the sprite character table (OBSEL Base=0).")
+    lines.append("; Call during forced blank. Assumes/leaves A8 XY16 (see init.asm).")
+    lines.append("load_char_gfx:")
+    lines.append("\tlda #$80            ; increment VRAM address after writing VMDATAH")
+    lines.append("\tsta VMAIN")
+    lines.append("")
+    lines.append("\tsetAXY16")
+    lines.append("\tlda #char_vram_addr")
+    lines.append("\tsta VMADDL")
+    lines.append("\tldx #.loword(char_data)")
+    lines.append("\tstx A1T0L")
+    lines.append("\tldx #char_data_size")
+    lines.append("\tstx DAS0L")
+    lines.append("")
+    lines.append("\tsetA8")
+    lines.append("\tlda #^char_data")
+    lines.append("\tsta A1B0")
+    lines.append("\tlda #$18            ; VMDATAL")
+    lines.append("\tsta BBAD0")
+    lines.append("\tlda #$01            ; mode 1: write 2 bytes (L,H) per src pair, increment src addr")
+    lines.append("\tsta DMAP0")
+    lines.append("\tlda #$01            ; enable DMA channel 0")
+    lines.append("\tsta MDMAEN")
+    lines.append("\trts")
+    lines.append("")
+
+    lines.append(f"; One (dx, dy, tile) triple per 16x16 OAM sprite needed to cover the whole")
+    lines.append(f"; character ({quads_x} x {quads_y} = {len(sprite_info)} sprites), row-major.")
+    lines.append("; dx/dy are pixel offsets from the character's top-left corner; tile is the")
+    lines.append("; first-tile-number to put in OAM (see docs/sprites.md).")
+    lines.append("char_sprite_info:")
+    for dx, dy, tile in sprite_info:
+        lines.append(f"\t.byte {dx}, {dy}, ${tile:02x}")
+    lines.append("char_sprite_info_end:")
+    lines.append("")
+    lines.append("char_sprite_info_size = char_sprite_info_end - char_sprite_info")
+    lines.append("")
+    lines.append("; Writes OAM entries for the char_sprite_info grid, placed on screen with")
+    lines.append("; its top-left corner at (char_x, char_y). Hides all other OAM sprites.")
+    lines.append("; Call during forced blank. Assumes/leaves A8 XY16 (see init.asm).")
+    lines.append("char_x = 104")
+    lines.append("char_y = 80")
+    lines.append("")
+    lines.append("draw_char_sprites:")
+    lines.append("\tstz OAMADDL")
+    lines.append("\tstz OAMADDH")
+    lines.append("")
+    lines.append("\tldx #0")
+    lines.append("sprite_loop:")
+    lines.append("\tlda char_sprite_info,x   ; dx")
+    lines.append("\tclc")
+    lines.append("\tadc #char_x")
+    lines.append("\tsta OAMDATA              ; X position")
+    lines.append("\tlda char_sprite_info+1,x ; dy")
+    lines.append("\tclc")
+    lines.append("\tadc #char_y")
+    lines.append("\tsta OAMDATA              ; Y position")
+    lines.append("\tlda char_sprite_info+2,x ; first tile number")
+    lines.append("\tsta OAMDATA")
+    lines.append("\tlda #$00                 ; palette 0, priority 0, no flip, name table 0")
+    lines.append("\tsta OAMDATA")
+    lines.append("\tinx")
+    lines.append("\tinx")
+    lines.append("\tinx")
+    lines.append("\tcpx #char_sprite_info_size")
+    lines.append("\tbne sprite_loop")
+    lines.append("")
+    lines.append(f"\tldx #({len(sprite_info)} * 4)")
+    lines.append("hide_loop:")
+    lines.append("\tlda #$00")
+    lines.append("\tsta OAMDATA              ; X position")
+    lines.append("\tlda #$f0")
+    lines.append("\tsta OAMDATA              ; Y position = 240, off the bottom edge")
+    lines.append("\tlda #$00")
+    lines.append("\tsta OAMDATA              ; tile")
+    lines.append("\tsta OAMDATA              ; attr")
+    lines.append("\tinx")
+    lines.append("\tinx")
+    lines.append("\tinx")
+    lines.append("\tinx")
+    lines.append("\tcpx #(128 * 4)")
+    lines.append("\tbne hide_loop")
+    lines.append("")
+    lines.append("\tstz OAMADDL")
+    lines.append("\tlda #$01")
+    lines.append("\tsta OAMADDH              ; OAM high table starts at byte 512")
+    lines.append("")
+    lines.append("\tldx #0")
+    lines.append("zero_high_loop:")
+    lines.append("\tstz OAMDATA")
+    lines.append("\tinx")
+    lines.append("\tcpx #32")
+    lines.append("\tbne zero_high_loop")
+    lines.append("\trts")
+    lines.append("")
 
     path.write_text("\n".join(lines))
 
@@ -169,11 +355,17 @@ def main():
     print(f"{BMP_PATH.name}: {width}x{height}, bmp_bpp={bmp_bpp}, "
           f"{len(palette)} palette entries, {used_colors} used by pixel data")
 
-    packed = pack_pixels(pixels, PIXEL_BPP)
-    print(f"packed {len(pixels)} pixels at {PIXEL_BPP}bpp -> {len(packed)} bytes")
+    tiles, tiles_x, tiles_y = split_into_tiles(pixels, width, height)
+    packed = pack_char_table(tiles, tiles_x, tiles_y, PIXEL_BPP)
+    print(f"packed {tiles_x}x{tiles_y} tiles at {PIXEL_BPP}bpp, padded to "
+          f"{TABLE_WIDTH_TILES}-wide -> {len(packed)} bytes")
+
+    sprite_info, quads_x, quads_y = build_sprite_info(tiles_x, tiles_y)
+    print(f"{quads_x}x{quads_y} = {len(sprite_info)} 16x16 OAM sprites needed")
 
     write_pallet_asm(PALLET_ASM_PATH, palette, bmp_bpp)
-    write_character_asm(CHARACTER_ASM_PATH, packed, width, height, PIXEL_BPP, len(palette))
+    write_character_asm(CHARACTER_ASM_PATH, packed, width, height, tiles_x, tiles_y,
+                         PIXEL_BPP, len(palette), sprite_info, quads_x, quads_y)
     print(f"wrote {PALLET_ASM_PATH}")
     print(f"wrote {CHARACTER_ASM_PATH}")
 

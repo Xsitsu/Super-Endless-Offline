@@ -1,15 +1,5 @@
 ; Init pallets
 
-.include "macros.inc"
-
-
-.macro pallet_16
-	lda $f0
-	sts CGADD
-
-.endmacro
-
-
 .segment "CODE"
 
 ; Color palette extracted from char.bmp (16 colors, 4 bits/pixel in the source BMP).
@@ -35,3 +25,26 @@ pallet_char:
 pallet_char_end:
 
 pallet_char_size = pallet_char_end - pallet_char
+
+; Loads pallet_char into CGRAM as sprite palette 0 (colors 128-143).
+; Call during forced blank. Assumes/leaves A8 XY16 (see init.asm).
+load_char_pallet:
+	lda #128            ; CGRAM color index 128 = sprite palette 0, color 0
+	sta CGADD
+
+	setAXY16
+	ldx #.loword(pallet_char)
+	stx A1T1L
+	ldx #pallet_char_size
+	stx DAS1L
+
+	setA8
+	lda #^pallet_char
+	sta A1B1
+	lda #$22            ; CGDATA
+	sta BBAD1
+	lda #$00            ; mode 0: write 1 byte per src, increment src addr
+	sta DMAP1
+	lda #$02            ; enable DMA channel 1
+	sta MDMAEN
+	rts

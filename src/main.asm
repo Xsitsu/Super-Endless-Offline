@@ -8,6 +8,9 @@
 
 .segment "CODE"
 
+.include "pallet.asm"
+.include "character.asm"
+
 start:
 	.include "init.asm"
 
@@ -20,6 +23,19 @@ start:
 	sta CGDATA
 	lda #$00
 	sta CGDATA
+
+	; Load the character's sprite palette and tile data, and place it on
+	; screen as a grid of 16x16 OAM sprites.
+	jsr load_char_pallet
+	jsr load_char_gfx
+
+	lda #$60            ; sprite size = 16x16/32x32, character table base = VRAM word $0000
+	sta OBSEL
+
+	jsr draw_char_sprites
+
+	lda #$10            ; enable OBJ on the main screen
+	sta TM
 
 	lda #$0f
 	sta INIDISP
