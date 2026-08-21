@@ -9,7 +9,7 @@
 .segment "CODE"
 
 .include "pallet.asm"
-.include "character.asm"
+.include "objects/include.asm"
 
 .segment "BSS"
 nmi_frame_count: .res 1    ; frames since the last pallet swap
