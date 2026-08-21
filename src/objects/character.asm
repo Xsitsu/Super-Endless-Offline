@@ -325,7 +325,8 @@ char_sprite_info_end:
 char_sprite_info_size = char_sprite_info_end - char_sprite_info
 
 ; Writes OAM entries for the char_sprite_info grid, placed on screen with
-; its top-left corner at (char_x, char_y). Hides all other OAM sprites.
+; its top-left corner at (char_x, char_y). All other OAM sprites are left
+; as-is (see init.asm for the one-time hiding of every OAM slot at boot).
 ; Call during forced blank. Assumes/leaves A8 XY16 (see init.asm).
 char_x = 104
 char_y = 80
@@ -353,31 +354,4 @@ sprite_loop:
 	inx
 	cpx #char_sprite_info_size
 	bne sprite_loop
-
-	ldx #(12 * 4)
-hide_loop:
-	lda #$00
-	sta OAMDATA              ; X position
-	lda #$f0
-	sta OAMDATA              ; Y position = 240, off the bottom edge
-	lda #$00
-	sta OAMDATA              ; tile
-	sta OAMDATA              ; attr
-	inx
-	inx
-	inx
-	inx
-	cpx #(128 * 4)
-	bne hide_loop
-
-	stz OAMADDL
-	lda #$01
-	sta OAMADDH              ; OAM high table starts at byte 512
-
-	ldx #0
-zero_high_loop:
-	stz OAMDATA
-	inx
-	cpx #32
-	bne zero_high_loop
 	rts

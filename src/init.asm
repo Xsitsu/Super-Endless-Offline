@@ -47,3 +47,37 @@ setA8
 
 ; Zero window masks
 stz WOBJSEL
+
+; Hide all OAM sprites (place them off the bottom edge of the screen, and
+; zero the OAM high table). Objects that want to be shown are responsible
+; for writing their own OAM entries afterwards; this only needs to run once
+; at boot to get every slot into a known, hidden state.
+stz OAMADDL
+stz OAMADDH
+
+ldx #0
+hide_all_sprites_loop:
+	lda #$00
+	sta OAMDATA              ; X position
+	lda #$f0
+	sta OAMDATA              ; Y position = 240, off the bottom edge
+	lda #$00
+	sta OAMDATA              ; tile
+	sta OAMDATA              ; attr
+	inx
+	inx
+	inx
+	inx
+	cpx #(128 * 4)
+	bne hide_all_sprites_loop
+
+stz OAMADDL
+lda #$01
+sta OAMADDH              ; OAM high table starts at byte 512
+
+ldx #0
+zero_oam_high_loop:
+	stz OAMDATA
+	inx
+	cpx #32
+	bne zero_oam_high_loop
